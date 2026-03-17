@@ -165,15 +165,21 @@ pub const BLOCK_LEN: usize = 64;
 /// the maximum degree of parallelism used by the implementation equals the number of chunks.
 pub const CHUNK_LEN: usize = 1024;
 
-const MAX_DEPTH: usize = 54; // 2^54 * CHUNK_LEN = 2^64
+/// The maximum depth of the hash tree. 2^54 * CHUNK_LEN = 2^64 bytes.
+const MAX_DEPTH: usize = 54;
 
-// While iterating the compression function within a chunk, the CV is
-// represented as words, to avoid doing two extra endianness conversions for
-// each compression in the portable implementation. But the hash_many interface
-// needs to hash both input bytes and parent nodes, so its better for its
-// output CVs to be represented as bytes.
+/// Chaining values represented as 32-bit words.
+/// 
+/// While iterating the compression function within a chunk, the CV is
+/// represented as words to avoid doing two extra endianness conversions for
+/// each compression in the portable implementation.
 type CVWords = [u32; 8];
-type CVBytes = [u8; 32]; // little-endian
+
+/// Chaining values represented as bytes in little-endian format.
+/// 
+/// The hash_many interface needs to hash both input bytes and parent nodes,
+/// so its output CVs are represented as bytes.
+type CVBytes = [u8; 32];
 
 const IV: &CVWords = &[
     0x6A09E667, 0xBB67AE85, 0x3C6EF372, 0xA54FF53A, 0x510E527F, 0x9B05688C, 0x1F83D9AB, 0x5BE0CD19,
@@ -201,11 +207,13 @@ const KEYED_HASH: u8 = 1 << 4;
 const DERIVE_KEY_CONTEXT: u8 = 1 << 5;
 const DERIVE_KEY_MATERIAL: u8 = 1 << 6;
 
+/// Extract the low 32 bits of a 64-bit counter.
 #[inline]
 fn counter_low(counter: u64) -> u32 {
     counter as u32
 }
 
+/// Extract the high 32 bits of a 64-bit counter.
 #[inline]
 fn counter_high(counter: u64) -> u32 {
     (counter >> 32) as u32
@@ -1125,23 +1133,22 @@ impl Hasher {
         self
     }
 
-    // As described in push_cv() below, we do "lazy merging", delaying merges
-    // until right before the next CV is about to be added. This is different
-    // from the reference implementation. Another difference is that we aren't
-    // always merging 1 chunk at a time. Instead, each CV might represent any
-    // power-of-two number of chunks, as long as the smaller-above-larger stack
-    // order is maintained. Instead of the "count the trailing 0-bits"
-    // algorithm described in the spec (which assumes you're adding one chunk
-    // at a time), we use a "count the total number of 1-bits" variant (which
-    // doesn't assume that). The principle is the same: each CV that should
-    // remain in the stack is represented by a 1-bit in the total number of
-    // chunks (or bytes) so far.
+    /// Merge chaining values on the stack using "lazy merging".
+    ///
+    /// Lazy merging delays merges until right before the next CV is added. This differs from
+    /// the reference implementation. Each CV might represent any power-of-two number of chunks,
+    /// maintaining smaller-above-larger stack order.
+    ///
+    /// Instead of the "count trailing 0-bits" algorithm (which assumes adding one chunk at a time),
+    /// we use "count total 1-bits" (no such assumption). The principle is the same: each CV that
+    /// should remain in the stack is represented by a 1-bit in the total chunk count.
     fn merge_cv_stack(&mut self, chunk_counter: u64) {
         // Account for non-zero cases of Hasher::set_input_offset, where there are no prior
         // subtrees in the stack. Note that initial_chunk_counter is always 0 for callers who don't
         // use the hazmat module.
-        let post_merge_stack_len =
-            (chunk_counter - self.initial_chunk_counter).count_ones() as usize;
+        let chunks_processed = chunk_counter - self.initial_chunk_counter;
+        let post_merge_stack_len = chunks_processed.count_ones() as usize;
+        
         while self.cv_stack.len() > post_merge_stack_len {
             let right_child = self.cv_stack.pop().unwrap();
             let left_child = self.cv_stack.pop().unwrap();
@@ -1206,177 +1213,160 @@ impl Hasher {
     }
 
     fn update_with_join<J: join::Join>(&mut self, mut input: &[u8]) -> &mut Self {
-        let input_offset = self.initial_chunk_counter * CHUNK_LEN as u64;
-        if let Some(max) = hazmat::max_subtree_len(input_offset) {
-            let remaining = max - self.count();
-            assert!(
-                input.len() as u64 <= remaining,
-                "the subtree starting at {} contains at most {} bytes (found {})",
-                CHUNK_LEN as u64 * self.initial_chunk_counter,
-                max,
-                input.len(),
-            );
-        }
-        // If we have some partial chunk bytes in the internal chunk_state, we
-        // need to finish that chunk first.
+        self.validate_input_size(input.len());
+        
+        // If we have a partial chunk, finish it first
         if self.chunk_state.count() > 0 {
-            let want = CHUNK_LEN - self.chunk_state.count();
-            let take = cmp::min(want, input.len());
-            self.chunk_state.update(&input[..take]);
-            input = &input[take..];
-            if !input.is_empty() {
-                // We've filled the current chunk, and there's more input
-                // coming, so we know it's not the root and we can finalize it.
-                // Then we'll proceed to hashing whole chunks below.
-                debug_assert_eq!(self.chunk_state.count(), CHUNK_LEN);
-                let chunk_cv = self.chunk_state.output().chaining_value();
-                self.push_cv(&chunk_cv, self.chunk_state.chunk_counter);
-                self.chunk_state = ChunkState::new(
-                    &self.key,
-                    self.chunk_state.chunk_counter + 1,
-                    self.chunk_state.flags,
-                    self.chunk_state.platform,
-                );
-            } else {
+            input = self.finish_partial_chunk(input);
+            if input.is_empty() {
                 return self;
             }
         }
 
-        // Now the chunk_state is clear, and we have more input. If there's
-        // more than a single chunk (so, definitely not the root chunk), hash
-        // the largest whole subtree we can, with the full benefits of SIMD and
-        // multithreading parallelism. Two restrictions:
-        // - The subtree has to be a power-of-2 number of chunks. Only subtrees
-        //   along the right edge can be incomplete, and we don't know where
-        //   the right edge is going to be until we get to finalize().
-        // - The subtree must evenly divide the total number of chunks up until
-        //   this point (if total is not 0). If the current incomplete subtree
-        //   is only waiting for 1 more chunk, we can't hash a subtree of 4
-        //   chunks. We have to complete the current subtree first.
-        // Because we might need to break up the input to form powers of 2, or
-        // to evenly divide what we already have, this part runs in a loop.
-        while input.len() > CHUNK_LEN {
-            debug_assert_eq!(self.chunk_state.count(), 0, "no partial chunk data");
-            debug_assert_eq!(CHUNK_LEN.count_ones(), 1, "power of 2 chunk len");
-            let mut subtree_len = largest_power_of_two_leq(input.len());
-            let count_so_far = self.chunk_state.chunk_counter * CHUNK_LEN as u64;
-            // Shrink the subtree_len until it evenly divides the count so far.
-            // We know that subtree_len itself is a power of 2, so we can use a
-            // bitmasking trick instead of an actual remainder operation. (Note
-            // that if the caller consistently passes power-of-2 inputs of the
-            // same size, as is hopefully typical, this loop condition will
-            // always fail, and subtree_len will always be the full length of
-            // the input.)
-            //
-            // An aside: We don't have to shrink subtree_len quite this much.
-            // For example, if count_so_far is 1, we could pass 2 chunks to
-            // compress_subtree_to_parent_node. Since we'll get 2 CVs back,
-            // we'll still get the right answer in the end, and we might get to
-            // use 2-way SIMD parallelism. The problem with this optimization,
-            // is that it gets us stuck always hashing 2 chunks. The total
-            // number of chunks will remain odd, and we'll never graduate to
-            // higher degrees of parallelism. See
-            // https://github.com/BLAKE3-team/BLAKE3/issues/69.
-            while (subtree_len - 1) as u64 & count_so_far != 0 {
-                subtree_len /= 2;
-            }
-            // The shrunken subtree_len might now be 1 chunk long. If so, hash
-            // that one chunk by itself. Otherwise, compress the subtree into a
-            // pair of CVs.
-            let subtree_chunks = (subtree_len / CHUNK_LEN) as u64;
-            if subtree_len <= CHUNK_LEN {
-                debug_assert_eq!(subtree_len, CHUNK_LEN);
-                self.push_cv(
-                    &ChunkState::new(
-                        &self.key,
-                        self.chunk_state.chunk_counter,
-                        self.chunk_state.flags,
-                        self.chunk_state.platform,
-                    )
-                    .update(&input[..subtree_len])
-                    .output()
-                    .chaining_value(),
-                    self.chunk_state.chunk_counter,
-                );
-            } else {
-                // This is the high-performance happy path, though getting here
-                // depends on the caller giving us a long enough input.
-                let cv_pair = compress_subtree_to_parent_node::<J>(
-                    &input[..subtree_len],
-                    &self.key,
-                    self.chunk_state.chunk_counter,
-                    self.chunk_state.flags,
-                    self.chunk_state.platform,
-                );
-                let left_cv = array_ref!(cv_pair, 0, 32);
-                let right_cv = array_ref!(cv_pair, 32, 32);
-                // Push the two CVs we received into the CV stack in order. Because
-                // the stack merges lazily, this guarantees we aren't merging the
-                // root.
-                self.push_cv(left_cv, self.chunk_state.chunk_counter);
-                self.push_cv(
-                    right_cv,
-                    self.chunk_state.chunk_counter + (subtree_chunks / 2),
-                );
-            }
-            self.chunk_state.chunk_counter += subtree_chunks;
-            input = &input[subtree_len..];
-        }
+        // Hash complete subtrees with SIMD and multithreading parallelism
+        self.process_complete_subtrees::<J>(&mut input);
 
-        // What remains is 1 chunk or less. Add it to the chunk state.
-        debug_assert!(input.len() <= CHUNK_LEN);
+        // Process remaining partial chunk (1 chunk or less)
         if !input.is_empty() {
+            debug_assert!(input.len() <= CHUNK_LEN);
             self.chunk_state.update(input);
-            // Having added some input to the chunk_state, we know what's in
-            // the CV stack won't become the root node, and we can do an extra
-            // merge. This simplifies finalize().
+            // Having added input to chunk_state, we know the CV stack won't become
+            // the root node, so we can merge early to simplify finalize()
             self.merge_cv_stack(self.chunk_state.chunk_counter);
         }
 
         self
     }
 
+    /// Validate that input size doesn't exceed the maximum subtree length.
+    fn validate_input_size(&self, input_len: usize) {
+        let input_offset = self.initial_chunk_counter * CHUNK_LEN as u64;
+        if let Some(max) = hazmat::max_subtree_len(input_offset) {
+            let remaining = max - self.count();
+            assert!(
+                input_len as u64 <= remaining,
+                "the subtree starting at {} contains at most {} bytes (found {})",
+                CHUNK_LEN as u64 * self.initial_chunk_counter,
+                max,
+                input_len,
+            );
+        }
+    }
+
+    /// Finish processing a partial chunk and return the remaining input.
+    fn finish_partial_chunk<'a>(&mut self, input: &'a [u8]) -> &'a [u8] {
+        let want = CHUNK_LEN - self.chunk_state.count();
+        let take = cmp::min(want, input.len());
+        self.chunk_state.update(&input[..take]);
+        let remaining = &input[take..];
+        
+        if !remaining.is_empty() {
+            // We've filled the current chunk with more input coming,
+            // so we know it's not the root and can finalize it
+            debug_assert_eq!(self.chunk_state.count(), CHUNK_LEN);
+            let chunk_cv = self.chunk_state.output().chaining_value();
+            self.push_cv(&chunk_cv, self.chunk_state.chunk_counter);
+            self.chunk_state = ChunkState::new(
+                &self.key,
+                self.chunk_state.chunk_counter + 1,
+                self.chunk_state.flags,
+                self.chunk_state.platform,
+            );
+        }
+        
+        remaining
+    }
+
+    /// Process complete subtrees with the full benefits of SIMD and multithreading.
+    ///
+    /// Two restrictions apply:
+    /// 1. The subtree must be a power-of-2 number of chunks (only right-edge subtrees
+    ///    can be incomplete, but we don't know the edge until finalize())
+    /// 2. The subtree must evenly divide the total chunks so far (to complete
+    ///    the current subtree before starting a new one)
+    fn process_complete_subtrees<J: join::Join>(&mut self, input: &mut &[u8]) {
+        while input.len() > CHUNK_LEN {
+            debug_assert_eq!(self.chunk_state.count(), 0, "no partial chunk data");
+            debug_assert_eq!(CHUNK_LEN.count_ones(), 1, "power of 2 chunk len");
+            
+            let subtree_len = self.calculate_subtree_len(input.len());
+            let subtree_chunks = (subtree_len / CHUNK_LEN) as u64;
+            
+            if subtree_len <= CHUNK_LEN {
+                self.process_single_chunk(&input[..subtree_len]);
+            } else {
+                self.process_multi_chunk_subtree::<J>(&input[..subtree_len], subtree_chunks);
+            }
+            
+            self.chunk_state.chunk_counter += subtree_chunks;
+            *input = &input[subtree_len..];
+        }
+    }
+
+    /// Calculate the appropriate subtree length for the given input size.
+    fn calculate_subtree_len(&self, input_len: usize) -> usize {
+        let mut subtree_len = largest_power_of_two_leq(input_len);
+        let count_so_far = self.chunk_state.chunk_counter * CHUNK_LEN as u64;
+        
+        // Shrink subtree_len until it evenly divides count_so_far.
+        // Since subtree_len is a power of 2, use bitmasking instead of modulo.
+        //
+        // Note: We could avoid shrinking this much (e.g., pass 2 chunks when count_so_far is 1),
+        // but that would lock us into always hashing 2 chunks, preventing us from graduating
+        // to higher degrees of parallelism. See https://github.com/BLAKE3-team/BLAKE3/issues/69
+        while (subtree_len - 1) as u64 & count_so_far != 0 {
+            subtree_len /= 2;
+        }
+        
+        subtree_len
+    }
+
+    /// Process a single chunk (when subtree_len equals CHUNK_LEN).
+    fn process_single_chunk(&mut self, chunk_data: &[u8]) {
+        debug_assert_eq!(chunk_data.len(), CHUNK_LEN);
+        let chunk_cv = ChunkState::new(
+            &self.key,
+            self.chunk_state.chunk_counter,
+            self.chunk_state.flags,
+            self.chunk_state.platform,
+        )
+        .update(chunk_data)
+        .output()
+        .chaining_value();
+        
+        self.push_cv(&chunk_cv, self.chunk_state.chunk_counter);
+    }
+
+    /// Process a multi-chunk subtree (high-performance path).
+    fn process_multi_chunk_subtree<J: join::Join>(&mut self, subtree_data: &[u8], subtree_chunks: u64) {
+        let cv_pair = compress_subtree_to_parent_node::<J>(
+            subtree_data,
+            &self.key,
+            self.chunk_state.chunk_counter,
+            self.chunk_state.flags,
+            self.chunk_state.platform,
+        );
+        
+        let left_cv = array_ref!(cv_pair, 0, 32);
+        let right_cv = array_ref!(cv_pair, 32, 32);
+        
+        // Push both CVs in order. Lazy merging guarantees we aren't merging the root.
+        self.push_cv(left_cv, self.chunk_state.chunk_counter);
+        self.push_cv(right_cv, self.chunk_state.chunk_counter + (subtree_chunks / 2));
+    }
+
+    /// Compute the final output by merging all chaining values.
     fn final_output(&self) -> Output {
-        // If the current chunk is the only chunk, that makes it the root node
-        // also. Convert it directly into an Output. Otherwise, we need to
-        // merge subtrees below.
+        // Single chunk case: it's the root node
         if self.cv_stack.is_empty() {
             debug_assert_eq!(self.chunk_state.chunk_counter, self.initial_chunk_counter);
             return self.chunk_state.output();
         }
 
-        // If there are any bytes in the ChunkState, finalize that chunk and
-        // merge its CV with everything in the CV stack. In that case, the work
-        // we did at the end of update() above guarantees that the stack
-        // doesn't contain any unmerged subtrees that need to be merged first.
-        // (This is important, because if there were two chunk hashes sitting
-        // on top of the stack, they would need to merge with each other, and
-        // merging a new chunk hash into them would be incorrect.)
-        //
-        // If there are no bytes in the ChunkState, we'll merge what's already
-        // in the stack. In this case it's fine if there are unmerged chunks on
-        // top, because we'll merge them with each other. Note that the case of
-        // the empty chunk is taken care of above.
-        let mut output: Output;
-        let mut num_cvs_remaining = self.cv_stack.len();
-        if self.chunk_state.count() > 0 {
-            debug_assert_eq!(
-                self.cv_stack.len(),
-                (self.chunk_state.chunk_counter - self.initial_chunk_counter).count_ones() as usize,
-                "cv stack does not need a merge",
-            );
-            output = self.chunk_state.output();
-        } else {
-            debug_assert!(self.cv_stack.len() >= 2);
-            output = parent_node_output(
-                &self.cv_stack[num_cvs_remaining - 2],
-                &self.cv_stack[num_cvs_remaining - 1],
-                &self.key,
-                self.chunk_state.flags,
-                self.chunk_state.platform,
-            );
-            num_cvs_remaining -= 2;
-        }
+        // Initialize output from either the current chunk or the top two stack CVs
+        let (mut output, mut num_cvs_remaining) = self.initialize_final_output();
+        
+        // Merge remaining CVs from the stack
         while num_cvs_remaining > 0 {
             output = parent_node_output(
                 &self.cv_stack[num_cvs_remaining - 1],
@@ -1387,7 +1377,36 @@ impl Hasher {
             );
             num_cvs_remaining -= 1;
         }
+        
         output
+    }
+
+    /// Initialize the final output from either the current chunk or top stack CVs.
+    fn initialize_final_output(&self) -> (Output, usize) {
+        let mut num_cvs_remaining = self.cv_stack.len();
+        
+        if self.chunk_state.count() > 0 {
+            // Finalize the current chunk and merge with the CV stack.
+            // The work at the end of update() guarantees the stack doesn't need merging first.
+            debug_assert_eq!(
+                self.cv_stack.len(),
+                (self.chunk_state.chunk_counter - self.initial_chunk_counter).count_ones() as usize,
+                "cv stack does not need a merge",
+            );
+            (self.chunk_state.output(), num_cvs_remaining)
+        } else {
+            // Merge the top two CVs from the stack
+            debug_assert!(self.cv_stack.len() >= 2);
+            let output = parent_node_output(
+                &self.cv_stack[num_cvs_remaining - 2],
+                &self.cv_stack[num_cvs_remaining - 1],
+                &self.key,
+                self.chunk_state.flags,
+                self.chunk_state.platform,
+            );
+            num_cvs_remaining -= 2;
+            (output, num_cvs_remaining)
+        }
     }
 
     /// Finalize the hash state and return the [`Hash`](struct.Hash.html) of
