@@ -270,11 +270,13 @@ size_t blake3_compress_subtree_wide(const uint8_t *input, size_t input_len,
                                     const uint32_t key[8],
                                     uint64_t chunk_counter, uint8_t flags,
                                     uint8_t *out, bool use_tbb) {
+  const size_t simd_degree = blake3_simd_degree();
+
   // Note that the single chunk case does *not* bump the SIMD degree up to 2
   // when it is 1. If this implementation adds multi-threading in the future,
   // this gives us the option of multi-threading even the 2-chunk case, which
   // can help performance on smaller platforms.
-  if (input_len <= blake3_simd_degree() * BLAKE3_CHUNK_LEN) {
+  if (input_len <= simd_degree * BLAKE3_CHUNK_LEN) {
     return compress_chunks_parallel(input, input_len, key, chunk_counter, flags,
                                     out);
   }
@@ -293,7 +295,7 @@ size_t blake3_compress_subtree_wide(const uint8_t *input, size_t input_len,
   // account for the special case of returning 2 outputs when the SIMD degree
   // is 1.
   uint8_t cv_array[2 * MAX_SIMD_DEGREE_OR_2 * BLAKE3_OUT_LEN];
-  size_t degree = blake3_simd_degree();
+  size_t degree = simd_degree;
   if (left_input_len > BLAKE3_CHUNK_LEN && degree == 1) {
     // The special case: We always use a degree of at least two, to make
     // sure there are two outputs. Except, as noted above, at the chunk
