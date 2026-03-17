@@ -99,6 +99,7 @@ impl Platform {
         Platform::Portable
     }
 
+    #[inline]
     pub fn simd_degree(&self) -> usize {
         let degree = match self {
             Platform::Portable => 1,
@@ -120,6 +121,7 @@ impl Platform {
         degree
     }
 
+    #[inline]
     pub fn compress_in_place(
         &self,
         cv: &mut CVWords,
@@ -156,6 +158,7 @@ impl Platform {
         }
     }
 
+    #[inline]
     pub fn compress_xof(
         &self,
         cv: &CVWords,
@@ -202,6 +205,7 @@ impl Platform {
     // after every block, there's a small but measurable performance loss.
     // Compressing chunks with a dedicated loop avoids this.
 
+    #[inline]
     pub fn hash_many<const N: usize>(
         &self,
         inputs: &[&[u8; N]],
@@ -312,6 +316,7 @@ impl Platform {
         }
     }
 
+    #[inline]
     pub fn xof_many(
         &self,
         cv: &CVWords,
@@ -337,11 +342,43 @@ impl Platform {
             _ => {
                 // For platforms without an optimized xof_many, fall back to a loop over
                 // compress_xof. This is still faster than portable code.
-                for out_block in out.chunks_exact_mut(BLOCK_LEN) {
-                    // TODO: Use array_chunks_mut here once that's stable.
-                    let out_array: &mut [u8; BLOCK_LEN] = out_block.try_into().unwrap();
-                    *out_array = self.compress_xof(cv, block, block_len, counter, flags);
-                    counter += 1;
+                // Process in chunks to improve instruction-level parallelism
+                let chunks = out.chunks_exact_mut(BLOCK_LEN);
+                let num_blocks = chunks.len();
+                
+                // Hint to the compiler about the expected iteration count for better unrolling
+                if num_blocks >= 4 {
+                    // Process 4 blocks at a time for better ILP
+                    let mut iter = out.chunks_exact_mut(BLOCK_LEN * 4);
+                    for chunk in iter.by_ref() {
+                        let (b0, rest) = chunk.split_at_mut(BLOCK_LEN);
+                        let (b1, rest) = rest.split_at_mut(BLOCK_LEN);
+                        let (b2, b3) = rest.split_at_mut(BLOCK_LEN);
+                        
+                        let r0 = self.compress_xof(cv, block, block_len, counter, flags);
+                        let r1 = self.compress_xof(cv, block, block_len, counter + 1, flags);
+                        let r2 = self.compress_xof(cv, block, block_len, counter + 2, flags);
+                        let r3 = self.compress_xof(cv, block, block_len, counter + 3, flags);
+                        
+                        b0.copy_from_slice(&r0);
+                        b1.copy_from_slice(&r1);
+                        b2.copy_from_slice(&r2);
+                        b3.copy_from_slice(&r3);
+                        
+                        counter += 4;
+                    }
+                    // Handle remainder
+                    for out_block in iter.into_remainder().chunks_exact_mut(BLOCK_LEN) {
+                        let out_array: &mut [u8; BLOCK_LEN] = out_block.try_into().unwrap();
+                        *out_array = self.compress_xof(cv, block, block_len, counter, flags);
+                        counter += 1;
+                    }
+                } else {
+                    for out_block in out.chunks_exact_mut(BLOCK_LEN) {
+                        let out_array: &mut [u8; BLOCK_LEN] = out_block.try_into().unwrap();
+                        *out_array = self.compress_xof(cv, block, block_len, counter, flags);
+                        counter += 1;
+                    }
                 }
             }
         }
@@ -472,72 +509,113 @@ pub fn sse2_detected() -> bool {
 
 #[inline(always)]
 pub fn words_from_le_bytes_32(bytes: &[u8; 32]) -> [u32; 8] {
-    let mut out = [0; 8];
-    out[0] = u32::from_le_bytes(*array_ref!(bytes, 0 * 4, 4));
-    out[1] = u32::from_le_bytes(*array_ref!(bytes, 1 * 4, 4));
-    out[2] = u32::from_le_bytes(*array_ref!(bytes, 2 * 4, 4));
-    out[3] = u32::from_le_bytes(*array_ref!(bytes, 3 * 4, 4));
-    out[4] = u32::from_le_bytes(*array_ref!(bytes, 4 * 4, 4));
-    out[5] = u32::from_le_bytes(*array_ref!(bytes, 5 * 4, 4));
-    out[6] = u32::from_le_bytes(*array_ref!(bytes, 6 * 4, 4));
-    out[7] = u32::from_le_bytes(*array_ref!(bytes, 7 * 4, 4));
-    out
+    // On little-endian architectures (which includes all x86/x86_64),
+    // we can use a direct pointer cast for zero-cost conversion.
+    #[cfg(target_endian = "little")]
+    {
+        // SAFETY: [u8; 32] and [u32; 8] have the same size and alignment requirements
+        // are satisfied (u8 align is 1, which divides any alignment).
+        // On little-endian, the byte representation is identical.
+        let ptr = bytes.as_ptr() as *const [u32; 8];
+        // Use read_unaligned since bytes may not be aligned to u32
+        unsafe { ptr.read_unaligned() }
+    }
+    #[cfg(not(target_endian = "little"))]
+    {
+        let mut out = [0; 8];
+        out[0] = u32::from_le_bytes(*array_ref!(bytes, 0 * 4, 4));
+        out[1] = u32::from_le_bytes(*array_ref!(bytes, 1 * 4, 4));
+        out[2] = u32::from_le_bytes(*array_ref!(bytes, 2 * 4, 4));
+        out[3] = u32::from_le_bytes(*array_ref!(bytes, 3 * 4, 4));
+        out[4] = u32::from_le_bytes(*array_ref!(bytes, 4 * 4, 4));
+        out[5] = u32::from_le_bytes(*array_ref!(bytes, 5 * 4, 4));
+        out[6] = u32::from_le_bytes(*array_ref!(bytes, 6 * 4, 4));
+        out[7] = u32::from_le_bytes(*array_ref!(bytes, 7 * 4, 4));
+        out
+    }
 }
 
 #[inline(always)]
 pub fn words_from_le_bytes_64(bytes: &[u8; 64]) -> [u32; 16] {
-    let mut out = [0; 16];
-    out[0] = u32::from_le_bytes(*array_ref!(bytes, 0 * 4, 4));
-    out[1] = u32::from_le_bytes(*array_ref!(bytes, 1 * 4, 4));
-    out[2] = u32::from_le_bytes(*array_ref!(bytes, 2 * 4, 4));
-    out[3] = u32::from_le_bytes(*array_ref!(bytes, 3 * 4, 4));
-    out[4] = u32::from_le_bytes(*array_ref!(bytes, 4 * 4, 4));
-    out[5] = u32::from_le_bytes(*array_ref!(bytes, 5 * 4, 4));
-    out[6] = u32::from_le_bytes(*array_ref!(bytes, 6 * 4, 4));
-    out[7] = u32::from_le_bytes(*array_ref!(bytes, 7 * 4, 4));
-    out[8] = u32::from_le_bytes(*array_ref!(bytes, 8 * 4, 4));
-    out[9] = u32::from_le_bytes(*array_ref!(bytes, 9 * 4, 4));
-    out[10] = u32::from_le_bytes(*array_ref!(bytes, 10 * 4, 4));
-    out[11] = u32::from_le_bytes(*array_ref!(bytes, 11 * 4, 4));
-    out[12] = u32::from_le_bytes(*array_ref!(bytes, 12 * 4, 4));
-    out[13] = u32::from_le_bytes(*array_ref!(bytes, 13 * 4, 4));
-    out[14] = u32::from_le_bytes(*array_ref!(bytes, 14 * 4, 4));
-    out[15] = u32::from_le_bytes(*array_ref!(bytes, 15 * 4, 4));
-    out
+    #[cfg(target_endian = "little")]
+    {
+        // SAFETY: Same reasoning as words_from_le_bytes_32
+        let ptr = bytes.as_ptr() as *const [u32; 16];
+        unsafe { ptr.read_unaligned() }
+    }
+    #[cfg(not(target_endian = "little"))]
+    {
+        let mut out = [0; 16];
+        out[0] = u32::from_le_bytes(*array_ref!(bytes, 0 * 4, 4));
+        out[1] = u32::from_le_bytes(*array_ref!(bytes, 1 * 4, 4));
+        out[2] = u32::from_le_bytes(*array_ref!(bytes, 2 * 4, 4));
+        out[3] = u32::from_le_bytes(*array_ref!(bytes, 3 * 4, 4));
+        out[4] = u32::from_le_bytes(*array_ref!(bytes, 4 * 4, 4));
+        out[5] = u32::from_le_bytes(*array_ref!(bytes, 5 * 4, 4));
+        out[6] = u32::from_le_bytes(*array_ref!(bytes, 6 * 4, 4));
+        out[7] = u32::from_le_bytes(*array_ref!(bytes, 7 * 4, 4));
+        out[8] = u32::from_le_bytes(*array_ref!(bytes, 8 * 4, 4));
+        out[9] = u32::from_le_bytes(*array_ref!(bytes, 9 * 4, 4));
+        out[10] = u32::from_le_bytes(*array_ref!(bytes, 10 * 4, 4));
+        out[11] = u32::from_le_bytes(*array_ref!(bytes, 11 * 4, 4));
+        out[12] = u32::from_le_bytes(*array_ref!(bytes, 12 * 4, 4));
+        out[13] = u32::from_le_bytes(*array_ref!(bytes, 13 * 4, 4));
+        out[14] = u32::from_le_bytes(*array_ref!(bytes, 14 * 4, 4));
+        out[15] = u32::from_le_bytes(*array_ref!(bytes, 15 * 4, 4));
+        out
+    }
 }
 
 #[inline(always)]
 pub fn le_bytes_from_words_32(words: &[u32; 8]) -> [u8; 32] {
-    let mut out = [0; 32];
-    *array_mut_ref!(out, 0 * 4, 4) = words[0].to_le_bytes();
-    *array_mut_ref!(out, 1 * 4, 4) = words[1].to_le_bytes();
-    *array_mut_ref!(out, 2 * 4, 4) = words[2].to_le_bytes();
-    *array_mut_ref!(out, 3 * 4, 4) = words[3].to_le_bytes();
-    *array_mut_ref!(out, 4 * 4, 4) = words[4].to_le_bytes();
-    *array_mut_ref!(out, 5 * 4, 4) = words[5].to_le_bytes();
-    *array_mut_ref!(out, 6 * 4, 4) = words[6].to_le_bytes();
-    *array_mut_ref!(out, 7 * 4, 4) = words[7].to_le_bytes();
-    out
+    #[cfg(target_endian = "little")]
+    {
+        // SAFETY: [u32; 8] and [u8; 32] have the same size.
+        // On little-endian, the memory representation is what we want.
+        unsafe { core::mem::transmute(*words) }
+    }
+    #[cfg(not(target_endian = "little"))]
+    {
+        let mut out = [0; 32];
+        *array_mut_ref!(out, 0 * 4, 4) = words[0].to_le_bytes();
+        *array_mut_ref!(out, 1 * 4, 4) = words[1].to_le_bytes();
+        *array_mut_ref!(out, 2 * 4, 4) = words[2].to_le_bytes();
+        *array_mut_ref!(out, 3 * 4, 4) = words[3].to_le_bytes();
+        *array_mut_ref!(out, 4 * 4, 4) = words[4].to_le_bytes();
+        *array_mut_ref!(out, 5 * 4, 4) = words[5].to_le_bytes();
+        *array_mut_ref!(out, 6 * 4, 4) = words[6].to_le_bytes();
+        *array_mut_ref!(out, 7 * 4, 4) = words[7].to_le_bytes();
+        out
+    }
 }
 
 #[inline(always)]
 pub fn le_bytes_from_words_64(words: &[u32; 16]) -> [u8; 64] {
-    let mut out = [0; 64];
-    *array_mut_ref!(out, 0 * 4, 4) = words[0].to_le_bytes();
-    *array_mut_ref!(out, 1 * 4, 4) = words[1].to_le_bytes();
-    *array_mut_ref!(out, 2 * 4, 4) = words[2].to_le_bytes();
-    *array_mut_ref!(out, 3 * 4, 4) = words[3].to_le_bytes();
-    *array_mut_ref!(out, 4 * 4, 4) = words[4].to_le_bytes();
-    *array_mut_ref!(out, 5 * 4, 4) = words[5].to_le_bytes();
-    *array_mut_ref!(out, 6 * 4, 4) = words[6].to_le_bytes();
-    *array_mut_ref!(out, 7 * 4, 4) = words[7].to_le_bytes();
-    *array_mut_ref!(out, 8 * 4, 4) = words[8].to_le_bytes();
-    *array_mut_ref!(out, 9 * 4, 4) = words[9].to_le_bytes();
-    *array_mut_ref!(out, 10 * 4, 4) = words[10].to_le_bytes();
-    *array_mut_ref!(out, 11 * 4, 4) = words[11].to_le_bytes();
-    *array_mut_ref!(out, 12 * 4, 4) = words[12].to_le_bytes();
-    *array_mut_ref!(out, 13 * 4, 4) = words[13].to_le_bytes();
-    *array_mut_ref!(out, 14 * 4, 4) = words[14].to_le_bytes();
-    *array_mut_ref!(out, 15 * 4, 4) = words[15].to_le_bytes();
-    out
+    #[cfg(target_endian = "little")]
+    {
+        // SAFETY: [u32; 16] and [u8; 64] have the same size.
+        // On little-endian, the memory representation is what we want.
+        unsafe { core::mem::transmute(*words) }
+    }
+    #[cfg(not(target_endian = "little"))]
+    {
+        let mut out = [0; 64];
+        *array_mut_ref!(out, 0 * 4, 4) = words[0].to_le_bytes();
+        *array_mut_ref!(out, 1 * 4, 4) = words[1].to_le_bytes();
+        *array_mut_ref!(out, 2 * 4, 4) = words[2].to_le_bytes();
+        *array_mut_ref!(out, 3 * 4, 4) = words[3].to_le_bytes();
+        *array_mut_ref!(out, 4 * 4, 4) = words[4].to_le_bytes();
+        *array_mut_ref!(out, 5 * 4, 4) = words[5].to_le_bytes();
+        *array_mut_ref!(out, 6 * 4, 4) = words[6].to_le_bytes();
+        *array_mut_ref!(out, 7 * 4, 4) = words[7].to_le_bytes();
+        *array_mut_ref!(out, 8 * 4, 4) = words[8].to_le_bytes();
+        *array_mut_ref!(out, 9 * 4, 4) = words[9].to_le_bytes();
+        *array_mut_ref!(out, 10 * 4, 4) = words[10].to_le_bytes();
+        *array_mut_ref!(out, 11 * 4, 4) = words[11].to_le_bytes();
+        *array_mut_ref!(out, 12 * 4, 4) = words[12].to_le_bytes();
+        *array_mut_ref!(out, 13 * 4, 4) = words[13].to_le_bytes();
+        *array_mut_ref!(out, 14 * 4, 4) = words[14].to_le_bytes();
+        *array_mut_ref!(out, 15 * 4, 4) = words[15].to_le_bytes();
+        out
+    }
 }

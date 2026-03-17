@@ -1029,6 +1029,10 @@ blake3_hash_many_avx512:
         movzx   eax, byte ptr [rbp+0x38]
         jne     9b
         mov     rbx, qword ptr [rbp+0x50]
+        prefetchw [rbx]
+        prefetchw [rbx+0x80]
+        prefetchw [rbx+0x100]
+        prefetchw [rbx+0x180]
         vpunpckldq zmm16, zmm0, zmm1
         vpunpckhdq zmm17, zmm0, zmm1
         vpunpckldq zmm18, zmm2, zmm3
@@ -1993,6 +1997,10 @@ blake3_hash_many_avx512:
         movzx   eax, byte ptr [rbp+0x38]
         jne     2b
         mov     rbx, qword ptr [rbp+0x50]
+        prefetchw [rbx]
+        prefetchw [rbx+0x40]
+        prefetchw [rbx+0x80]
+        prefetchw [rbx+0xC0]
         vunpcklps ymm8, ymm0, ymm1
         vunpcklps ymm9, ymm2, ymm3
         vunpckhps ymm10, ymm0, ymm1
