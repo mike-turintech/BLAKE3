@@ -1674,6 +1674,8 @@ blake3_hash_many_sse2:
         add     rdx, 64
         cmp     rdx, r15
         cmovne  eax, r14d
+        prefetcht0 [r8+rdx+0x80]
+        prefetcht0 [r9+rdx+0x80]
         movaps  xmm2, xmmword ptr [BLAKE3_IV+rip]
         movaps  xmm10, xmm2
         movups  xmm4, xmmword ptr [r8+rdx-0x40]
@@ -1914,6 +1916,7 @@ blake3_hash_many_sse2:
         add     rdx, 64
         cmp     rdx, r15
         cmovne  eax, r14d
+        prefetcht0 [r8+rdx+0x80]
         movaps  xmm2, xmmword ptr [BLAKE3_IV+rip]
         shl     rax, 32
         or      rax, 64
