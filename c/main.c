@@ -114,7 +114,10 @@ int main(int argc, char **argv) {
    */
   size_t buf_capacity = 1 << 20;
   uint8_t *buf = malloc(buf_capacity);
-  assert(buf != NULL);
+  if (buf_capacity > 0 && buf == NULL) {
+    fprintf(stderr, "malloc() failed.\n");
+    return 1;
+  }
   size_t buf_len = 0;
   while (1) {
     size_t n = fread(&buf[buf_len], 1, buf_capacity - buf_len, stdin);
@@ -151,6 +154,7 @@ int main(int argc, char **argv) {
     uint8_t *out = malloc(out_len);
     if (out_len > 0 && out == NULL) {
       fprintf(stderr, "malloc() failed.\n");
+      free(buf);
       return 1;
     }
     blake3_hasher_finalize(&hasher, out, out_len);
